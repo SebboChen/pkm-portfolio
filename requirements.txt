@@ -3,4 +3,4 @@ uvicorn
 psycopg[binary]
 pandas
 matplotlib
-
+requests
