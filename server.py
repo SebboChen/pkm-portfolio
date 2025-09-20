@@ -227,10 +227,15 @@ def _run_sync() -> dict:
     inserted = 0
     with get_conn() as cx:
         for row in data:
-            idp = int(row.get("idProduct"))
-            avg = row.get("avgPrice")
-            low = row.get("lowPrice")
-            trend = row.get("trendPrice")
+            idp = int(
+            row.get("idProduct") or
+            row.get("productId") or
+            row.get("id_product")
+            )
+            avg   = row.get("avgPrice");   avg   = row.get("avg")   if avg   is None else avg
+            low   = row.get("lowPrice");   low   = row.get("low")   if low   is None else low
+            trend = row.get("trendPrice"); trend = row.get("trend") if trend is None else trend
+
             cx.execute(
                 "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
                 "values (%s,%s,%s,%s,%s,%s) "
@@ -306,13 +311,15 @@ def _run_sync() -> dict:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Kein valides JSON von CARDMARKET_URL: {type(e).__name__}: {e}")
 
-    if isinstance(data, dict):
-        if "products" in data:
-            data = data["products"]
-        elif "data" in data:
-            data = data["data"]
-    if not isinstance(data, list):
-        raise HTTPException(status_code=400, detail="Unerwartetes JSON-Format: Array mit Preiszeilen erwartet.")
+   # 3) Array finden (Cardmarket Price Guide: "priceGuides")
+if isinstance(data, dict):
+    for key in ("priceGuides", "products", "data", "items", "rows"):
+        if isinstance(data.get(key), list):
+            data = data[key]
+            break
+if not isinstance(data, list):
+    raise HTTPException(status_code=400, detail="Unerwartetes JSON-Format: Array mit Preiszeilen erwartet.")
+
 
     today = date.today()
     inserted = 0
