@@ -1,0 +1,17 @@
+name: daily-sync
+
+on:
+  schedule:
+    # Läuft täglich um 07:10 Berlin (Sommerzeit) = 05:10 UTC
+    - cron: "10 5 * * *"
+  workflow_dispatch: {}   # manueller Start möglich
+
+jobs:
+  call-sync:
+    runs-on: ubuntu-latest
+    env:
+      SERVICE_URL: https://pkm-portfolio.onrender.com   # <- ggf. ändern
+    steps:
+      - name: Trigger /api/sync
+        run: |
+          curl -sS -f "$SERVICE_URL/api/sync?token=${{ secrets.SYNC_TOKEN }}"
