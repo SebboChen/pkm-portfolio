@@ -160,3 +160,39 @@ def portfolio_value():
         """)
         total = float(cur.fetchone()[0] or 0.0)
     return {"total_eur": round(total, 2)}
+
+# --- Plot-Endpoint ---
+import io
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from fastapi.responses import Response
+
+@app.get("/api/plot")
+def plot_portfolio():
+    with get_conn() as cx:
+        df = pd.read_sql("""
+            select p.date::date as date, c.id_product, h.quantity,
+                   coalesce(p.trend_price, p.avg_price, p.low_price) as price
+            from prices_daily p
+            join cards c on c.id_product = p.id_product
+            join holdings h on h.card_id = c.id
+        """, cx)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Keine Preisdaten vorhanden.")
+
+    df["value"] = df["quantity"] * df["price"].astype(float)
+    ts = df.groupby("date")["value"].sum().sort_index()
+
+    buf = io.BytesIO()
+    plt.figure()
+    plt.plot(ts.index, ts.values)
+    plt.title("Portfolio-Wert (EUR)")
+    plt.xlabel("Datum")
+    plt.ylabel("Wert")
+    plt.tight_layout()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+    return Response(content=buf.read(), media_type="image/png")
