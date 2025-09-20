@@ -1,6 +1,8 @@
 import os
 from fastapi import FastAPI, HTTPException, Query
 import psycopg
+from psycopg.types.json import Json
+
 
 app = FastAPI()
 
@@ -138,7 +140,7 @@ def import_prices(rows: List[Dict[str, Any]], token: str = Query(..., alias="tok
                 "on conflict (id_product,date) do update set "
                 "avg_price=excluded.avg_price, low_price=excluded.low_price, "
                 "trend_price=excluded.trend_price, data=excluded.data",
-                (idp, today, avg, low, trend, row)
+                (idp, today, avg, low, trend, Json(row))
             )
             inserted += 1
     return {"inserted": inserted, "date": str(today)}
