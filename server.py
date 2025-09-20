@@ -114,3 +114,47 @@ def list_cards():
         )
         rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
     return rows
+
+from typing import List, Dict, Any
+from datetime import date
+from fastapi import Query, HTTPException
+
+@app.post("/admin/import")
+def import_prices(rows: List[Dict[str, Any]], token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    today = date.today()
+    inserted = 0
+    with get_conn() as cx:
+        for row in rows:
+            # Erwartete Felder: idProduct, avgPrice, lowPrice, trendPrice
+            idp = int(row.get("idProduct"))
+            avg = row.get("avgPrice")
+            low = row.get("lowPrice")
+            trend = row.get("trendPrice")
+            cx.execute(
+                "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
+                "values (%s,%s,%s,%s,%s,%s) "
+                "on conflict (id_product,date) do update set "
+                "avg_price=excluded.avg_price, low_price=excluded.low_price, "
+                "trend_price=excluded.trend_price, data=excluded.data",
+                (idp, today, avg, low, trend, row)
+            )
+            inserted += 1
+    return {"inserted": inserted, "date": str(today)}
+
+@app.get("/api/portfolio")
+def portfolio_value():
+    with get_conn() as cx:
+        cur = cx.execute("""
+            with latest as (
+              select id_product, max(date) d from prices_daily group by id_product
+            )
+            select coalesce(sum(h.quantity * coalesce(p.trend_price,p.avg_price,p.low_price,0)),0)
+            from holdings h
+            join cards c on c.id = h.card_id
+            left join latest l on l.id_product = c.id_product
+            left join prices_daily p on p.id_product = c.id_product and p.date = l.d
+        """)
+        total = float(cur.fetchone()[0] or 0.0)
+    return {"total_eur": round(total, 2)}
