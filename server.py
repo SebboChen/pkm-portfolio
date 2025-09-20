@@ -253,3 +253,97 @@ def sync_get(token: str = Query(..., alias="token")):
     if token != SYNC_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     return _run_sync()
+
+# --- Sync + Diagnose ---
+import json, gzip, requests
+from datetime import date
+from psycopg.types.json import Json
+from fastapi import HTTPException, Query
+
+CARDMARKET_URL = os.environ.get("CARDMARKET_URL", "")
+MKM_COOKIE = os.environ.get("MKM_COOKIE", "")
+
+@app.get("/debug/sync-check")
+def debug_sync_check(token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if not CARDMARKET_URL:
+        raise HTTPException(status_code=400, detail="CARDMARKET_URL fehlt")
+    headers = {}
+    if MKM_COOKIE:
+        headers["Cookie"] = MKM_COOKIE
+    r = requests.get(CARDMARKET_URL, headers=headers, timeout=60, allow_redirects=True)
+    preview = r.text[:160] if r.text else ""
+    return {
+        "status_code": r.status_code,
+        "content_type": r.headers.get("Content-Type", ""),
+        "content_length": len(r.content),
+        "preview": preview
+    }
+
+def _run_sync() -> dict:
+    if not CARDMARKET_URL:
+        raise HTTPException(status_code=400, detail="CARDMARKET_URL fehlt (Render → Environment)")
+
+    headers = {}
+    if MKM_COOKIE:
+        headers["Cookie"] = MKM_COOKIE
+
+    try:
+        r = requests.get(CARDMARKET_URL, headers=headers, timeout=120, allow_redirects=True)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Download fehlgeschlagen: {type(e).__name__}: {e}")
+
+    content = r.content
+    ct = (r.headers.get("Content-Type") or "").lower()
+    ce = (r.headers.get("Content-Encoding") or "").lower()
+    try:
+        if "gzip" in ce or "application/gzip" in ct or CARDMARKET_URL.endswith(".gz"):
+            content = gzip.decompress(content)
+        text = content.decode("utf-8", errors="replace")
+        data = json.loads(text)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Kein valides JSON von CARDMARKET_URL: {type(e).__name__}: {e}")
+
+    if isinstance(data, dict):
+        if "products" in data:
+            data = data["products"]
+        elif "data" in data:
+            data = data["data"]
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="Unerwartetes JSON-Format: Array mit Preiszeilen erwartet.")
+
+    today = date.today()
+    inserted = 0
+    with get_conn() as cx:
+        for row in data:
+            try:
+                idp = int(row.get("idProduct"))
+            except Exception:
+                continue
+            avg = row.get("avgPrice")
+            low = row.get("lowPrice")
+            trend = row.get("trendPrice")
+            cx.execute(
+                "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
+                "values (%s,%s,%s,%s,%s,%s) "
+                "on conflict (id_product,date) do update set "
+                "avg_price=excluded.avg_price, low_price=excluded.low_price, "
+                "trend_price=excluded.trend_price, data=excluded.data",
+                (idp, today, avg, low, trend, Json(row))
+            )
+            inserted += 1
+    return {"status": "ok", "inserted": inserted, "date": str(today)}
+
+@app.get("/api/sync")
+def sync_get(token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_sync()
+
+@app.post("/api/sync")
+def sync_post(token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_sync()
