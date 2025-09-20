@@ -118,18 +118,24 @@ def list_cards():
     return rows
 
 from typing import List, Dict, Any
-from datetime import date
+from datetime import date, datetime
 from fastapi import Query, HTTPException
 
 @app.post("/admin/import")
-def import_prices(rows: List[Dict[str, Any]], token: str = Query(..., alias="token")):
+def import_prices(
+    rows: List[Dict[str, Any]],
+    token: str = Query(..., alias="token"),
+    when: str | None = Query(None)  # z.B. "2025-09-18"
+):
     if token != SYNC_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
-    today = date.today()
+    try:
+        today = date.today() if not when else datetime.strptime(when, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="when muss YYYY-MM-DD sein")
     inserted = 0
     with get_conn() as cx:
         for row in rows:
-            # Erwartete Felder: idProduct, avgPrice, lowPrice, trendPrice
             idp = int(row.get("idProduct"))
             avg = row.get("avgPrice")
             low = row.get("lowPrice")
@@ -140,7 +146,7 @@ def import_prices(rows: List[Dict[str, Any]], token: str = Query(..., alias="tok
                 "on conflict (id_product,date) do update set "
                 "avg_price=excluded.avg_price, low_price=excluded.low_price, "
                 "trend_price=excluded.trend_price, data=excluded.data",
-                (idp, today, avg, low, trend, Json(row))
+                (idp, today, avg, low, trend, Json(row))  # Json(row) hast du bereits eingebaut
             )
             inserted += 1
     return {"inserted": inserted, "date": str(today)}
