@@ -1,7 +1,22 @@
 import os
-from fastapi import FastAPI, HTTPException, Query
+import io
+import json
+import gzip
+from datetime import date, datetime
+from typing import Optional, List, Dict, Any
+
 import psycopg
 from psycopg.types.json import Json
+
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
+from pydantic import BaseModel
 
 
 app = FastAPI()
@@ -9,6 +24,8 @@ app = FastAPI()
 # --- Konfig aus Render-Umgebungsvariablen ---
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SYNC_TOKEN = os.environ.get("SYNC_TOKEN", "")
+CARDMARKET_URL = os.environ.get("CARDMARKET_URL", "")
+MKM_COOKIE = os.environ.get("MKM_COOKIE", "")  # optional
 
 # --- DB-Schema (Tabellen) ---
 SCHEMA_SQL = """
@@ -48,7 +65,7 @@ def get_conn():
 def health():
     return {"ok": True}
 
-# POST-Variante (für Tools / später)
+# ---- DB init (POST und GET) ----
 @app.post("/admin/init-db")
 def init_db_post(token: str = Query(..., alias="token")):
     if token != SYNC_TOKEN:
@@ -57,7 +74,6 @@ def init_db_post(token: str = Query(..., alias="token")):
         cx.execute(SCHEMA_SQL)
     return {"status": "db-initialized"}
 
-# GET-Variante (bequem per Browser anklickbar)
 @app.get("/admin/init-db")
 def init_db_get(token: str = Query(..., alias="token")):
     if token != SYNC_TOKEN:
@@ -66,9 +82,8 @@ def init_db_get(token: str = Query(..., alias="token")):
         cx.execute(SCHEMA_SQL)
     return {"status": "db-initialized"}
 
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
 
+# ---- Cards + Holdings ----
 class NewCard(BaseModel):
     id_product: Optional[int] = None
     name: str
@@ -117,20 +132,18 @@ def list_cards():
         rows = [dict(zip([d[0] for d in cur.description], r)) for r in cur.fetchall()]
     return rows
 
-from typing import List, Dict, Any
-from datetime import date, datetime
-from fastapi import Query, HTTPException
 
+# ---- Preis-Import (manuell) + Portfolio ----
 @app.post("/admin/import")
 def import_prices(
     rows: List[Dict[str, Any]],
     token: str = Query(..., alias="token"),
-    when: str | None = Query(None)  # z.B. "2025-09-18"
+    when: Optional[str] = Query(None)  # z.B. "2025-09-18"
 ):
     if token != SYNC_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
     try:
-        today = date.today() if not when else datetime.strptime(when, "%Y-%m-%d").date()
+        day = date.today() if not when else datetime.strptime(when, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=400, detail="when muss YYYY-MM-DD sein")
     inserted = 0
@@ -146,10 +159,10 @@ def import_prices(
                 "on conflict (id_product,date) do update set "
                 "avg_price=excluded.avg_price, low_price=excluded.low_price, "
                 "trend_price=excluded.trend_price, data=excluded.data",
-                (idp, today, avg, low, trend, Json(row))  # Json(row) hast du bereits eingebaut
+                (idp, day, avg, low, trend, Json(row))
             )
             inserted += 1
-    return {"inserted": inserted, "date": str(today)}
+    return {"inserted": inserted, "date": str(day)}
 
 @app.get("/api/portfolio")
 def portfolio_value():
@@ -167,14 +180,8 @@ def portfolio_value():
         total = float(cur.fetchone()[0] or 0.0)
     return {"total_eur": round(total, 2)}
 
-# --- Plot-Endpoint ---
-import io
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from fastapi.responses import Response
 
+# ---- Plot ----
 @app.get("/api/plot")
 def plot_portfolio():
     with get_conn() as cx:
@@ -203,71 +210,8 @@ def plot_portfolio():
     buf.seek(0)
     return Response(content=buf.read(), media_type="image/png")
 
-import requests
-from psycopg.types.json import Json
-from datetime import date
-from fastapi import Query, HTTPException
 
-CARDMARKET_URL = os.environ.get("CARDMARKET_URL", "")
-MKM_COOKIE = os.environ.get("MKM_COOKIE", "")  # optional
-
-def _run_sync() -> dict:
-    if not CARDMARKET_URL:
-        raise HTTPException(status_code=400, detail="CARDMARKET_URL fehlt (Render → Environment)")
-
-    headers = {}
-    if MKM_COOKIE:
-        headers["Cookie"] = MKM_COOKIE
-
-    r = requests.get(CARDMARKET_URL, headers=headers, timeout=120)
-    r.raise_for_status()
-    data = r.json()  # Erwartet ein Array mit Feldern idProduct/avgPrice/lowPrice/trendPrice
-
-    today = date.today()
-    inserted = 0
-    with get_conn() as cx:
-        for row in data:
-            idp = int(
-            row.get("idProduct") or
-            row.get("productId") or
-            row.get("id_product")
-            )
-            avg   = row.get("avgPrice");   avg   = row.get("avg")   if avg   is None else avg
-            low   = row.get("lowPrice");   low   = row.get("low")   if low   is None else low
-            trend = row.get("trendPrice"); trend = row.get("trend") if trend is None else trend
-
-            cx.execute(
-                "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
-                "values (%s,%s,%s,%s,%s,%s) "
-                "on conflict (id_product,date) do update set "
-                "avg_price=excluded.avg_price, low_price=excluded.low_price, "
-                "trend_price=excluded.trend_price, data=excluded.data",
-                (idp, today, avg, low, trend, Json(row))
-            )
-            inserted += 1
-    return {"status": "ok", "inserted": inserted, "date": str(today)}
-
-@app.post("/api/sync")
-def sync_post(token: str = Query(..., alias="token")):
-    if token != SYNC_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return _run_sync()
-
-@app.get("/api/sync")
-def sync_get(token: str = Query(..., alias="token")):
-    if token != SYNC_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return _run_sync()
-
-# --- Sync + Diagnose ---
-import json, gzip, requests
-from datetime import date
-from psycopg.types.json import Json
-from fastapi import HTTPException, Query
-
-CARDMARKET_URL = os.environ.get("CARDMARKET_URL", "")
-MKM_COOKIE = os.environ.get("MKM_COOKIE", "")
-
+# ---- Diagnose + Sync (robust) ----
 @app.get("/debug/sync-check")
 def debug_sync_check(token: str = Query(..., alias="token")):
     if token != SYNC_TOKEN:
@@ -294,12 +238,14 @@ def _run_sync() -> dict:
     if MKM_COOKIE:
         headers["Cookie"] = MKM_COOKIE
 
+    # 1) Download
     try:
         r = requests.get(CARDMARKET_URL, headers=headers, timeout=120, allow_redirects=True)
         r.raise_for_status()
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Download fehlgeschlagen: {type(e).__name__}: {e}")
 
+    # 2) JSON ermitteln (inkl. gzip-Fall)
     content = r.content
     ct = (r.headers.get("Content-Type") or "").lower()
     ce = (r.headers.get("Content-Encoding") or "").lower()
@@ -311,27 +257,34 @@ def _run_sync() -> dict:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Kein valides JSON von CARDMARKET_URL: {type(e).__name__}: {e}")
 
-   # 3) Array finden (Cardmarket Price Guide: "priceGuides")
-if isinstance(data, dict):
-    for key in ("priceGuides", "products", "data", "items", "rows"):
-        if isinstance(data.get(key), list):
-            data = data[key]
-            break
-if not isinstance(data, list):
-    raise HTTPException(status_code=400, detail="Unerwartetes JSON-Format: Array mit Preiszeilen erwartet.")
+    # 3) Array finden (Cardmarket Price Guide: "priceGuides")
+    if isinstance(data, dict):
+        for key in ("priceGuides", "products", "data", "items", "rows"):
+            v = data.get(key)
+            if isinstance(v, list):
+                data = v
+                break
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="Unerwartetes JSON-Format: Array mit Preiszeilen erwartet.")
 
-
+    # 4) Feld-Mapping + Import
     today = date.today()
     inserted = 0
     with get_conn() as cx:
         for row in data:
             try:
-                idp = int(row.get("idProduct"))
+                idp = int(
+                    row.get("idProduct") or
+                    row.get("productId") or
+                    row.get("id_product")
+                )
             except Exception:
                 continue
-            avg = row.get("avgPrice")
-            low = row.get("lowPrice")
-            trend = row.get("trendPrice")
+
+            avg   = row.get("avgPrice");   avg   = row.get("avg")   if avg   is None else avg
+            low   = row.get("lowPrice");   low   = row.get("low")   if low   is None else low
+            trend = row.get("trendPrice"); trend = row.get("trend") if trend is None else trend
+
             cx.execute(
                 "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
                 "values (%s,%s,%s,%s,%s,%s) "
@@ -341,6 +294,7 @@ if not isinstance(data, list):
                 (idp, today, avg, low, trend, Json(row))
             )
             inserted += 1
+
     return {"status": "ok", "inserted": inserted, "date": str(today)}
 
 @app.get("/api/sync")
