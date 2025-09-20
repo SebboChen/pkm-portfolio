@@ -202,3 +202,54 @@ def plot_portfolio():
     plt.close()
     buf.seek(0)
     return Response(content=buf.read(), media_type="image/png")
+
+import requests
+from psycopg.types.json import Json
+from datetime import date
+from fastapi import Query, HTTPException
+
+CARDMARKET_URL = os.environ.get("CARDMARKET_URL", "")
+MKM_COOKIE = os.environ.get("MKM_COOKIE", "")  # optional
+
+def _run_sync() -> dict:
+    if not CARDMARKET_URL:
+        raise HTTPException(status_code=400, detail="CARDMARKET_URL fehlt (Render → Environment)")
+
+    headers = {}
+    if MKM_COOKIE:
+        headers["Cookie"] = MKM_COOKIE
+
+    r = requests.get(CARDMARKET_URL, headers=headers, timeout=120)
+    r.raise_for_status()
+    data = r.json()  # Erwartet ein Array mit Feldern idProduct/avgPrice/lowPrice/trendPrice
+
+    today = date.today()
+    inserted = 0
+    with get_conn() as cx:
+        for row in data:
+            idp = int(row.get("idProduct"))
+            avg = row.get("avgPrice")
+            low = row.get("lowPrice")
+            trend = row.get("trendPrice")
+            cx.execute(
+                "insert into prices_daily(id_product,date,avg_price,low_price,trend_price,data) "
+                "values (%s,%s,%s,%s,%s,%s) "
+                "on conflict (id_product,date) do update set "
+                "avg_price=excluded.avg_price, low_price=excluded.low_price, "
+                "trend_price=excluded.trend_price, data=excluded.data",
+                (idp, today, avg, low, trend, Json(row))
+            )
+            inserted += 1
+    return {"status": "ok", "inserted": inserted, "date": str(today)}
+
+@app.post("/api/sync")
+def sync_post(token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_sync()
+
+@app.get("/api/sync")
+def sync_get(token: str = Query(..., alias="token")):
+    if token != SYNC_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return _run_sync()
